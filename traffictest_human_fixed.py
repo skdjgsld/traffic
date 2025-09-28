@@ -1,313 +1,224 @@
-# traffictest_human_fixed.py
+# run_fixed_visitor.py
 """
-Güncellenmiş: sabit start URL, screenshot kapalı, tekrar sayısı (repeats).
-UYARI: Yalnızca sahip olduğunuz veya izin verilen sitelerde kullanın.
+Basit, izinli test amaçlı: tüm gezintiler SABİT START_URL'e gider.
+KULLANIM (varsayılan): python run_fixed_visitor.py
+Opsiyonel: python run_fixed_visitor.py --repeats 5 --headless
+
+UYARI: Bu scripti SADECE SİZİN SAHİP OLDUĞUNUZ veya İZİN VERİLEN hedeflerde kullanın.
 """
 
-import os
-import sys
 import time
-import json
 import random
 import logging
 import argparse
-import traceback
 from urllib.parse import urlparse
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.firefox.options import Options
-from selenium.webdriver.firefox.service import Service
-from webdriver_manager.firefox import GeckoDriverManager
-from selenium.common.exceptions import TimeoutException, WebDriverException
+# ------- AYARLAR (değiştirmeye gerek yok) -------
+START_URL = "https://share.google/TMi8EqcYT6JBBEEeX"  # sabit hedef link
+DEFAULT_REPEATS = 10
+DEFAULT_MAX_PAGES = 6   # oturum başına yapılacak "etkileşim sayısı" - mantıksal limit
 
-# -------- CONFIG FIXED --------
-START_URL = "https://share.google/TMi8EqcYT6JBBEEeX"  # sabit URL
-REPEATS = 10  # default tekrar sayısı
-
-# -------- CONFIG DEFAULTS --------
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
 ]
 
-DEFAULT_WAIT_MIN = 1.2
-DEFAULT_WAIT_MAX = 4.0
-DEFAULT_VISIT_LIMIT = 30
-SCREENSHOT_DIR = "screenshots"
-COOKIES_FILE = "cookies.json"
-LOG_FILE = "traffictest_human_fixed.log"
+VIEWPORTS = [(1280,800), (1366,768), (1440,900), (1536,864), (1024,1366)]
+LOCALES = ["tr-TR", "tr", "en-US"]
 
-# Turn screenshotting off as requested
-SAVE_SCREENSHOTS = False
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# -------- LOGGING --------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()]
-)
+# ------- HELPER FONKSİYONLAR -------
+def ease_in_out(t):
+    import math
+    return 0.5 - 0.5 * math.cos(math.pi * t)
 
-# -------- HELPERS --------
-def human_sleep(min_s=DEFAULT_WAIT_MIN, max_s=DEFAULT_WAIT_MAX, jitter=0.5):
-    s = random.uniform(min_s, max_s) + random.uniform(0, jitter)
-    logging.info(f"Sleeping {s:.2f}s (human-like)")
-    time.sleep(s)
+def human_move(mouse, start, end, steps=50, pause=(0.003, 0.012)):
+    sx, sy = start; ex, ey = end
+    for i in range(1, steps+1):
+        t = i/steps
+        e = ease_in_out(t)
+        x = sx + (ex - sx) * e + random.uniform(-2.0, 2.0)
+        y = sy + (ey - sy) * e + random.uniform(-2.0, 2.0)
+        try:
+            mouse.move(x, y)
+        except Exception:
+            pass
+        time.sleep(random.uniform(*pause))
 
-def rand_user_agent():
-    return random.choice(USER_AGENTS)
-
-def save_screenshot(driver, tag=""):
-    if not SAVE_SCREENSHOTS:
-        return
-    if not os.path.exists(SCREENSHOT_DIR):
-        os.makedirs(SCREENSHOT_DIR)
-    fn = os.path.join(SCREENSHOT_DIR, f"{int(time.time())}_{tag}.png")
-    try:
-        driver.save_screenshot(fn)
-        logging.info(f"Saved screenshot: {fn}")
-    except Exception as e:
-        logging.warning(f"Screenshot failed: {e}")
-
-def load_cookies(path):
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
+def human_scroll(page, total=600):
+    scrolled = 0
+    while scrolled < total:
+        step = random.randint(60, 220)
+        try:
+            page.mouse.wheel(0, step)
+        except Exception:
             try:
-                return json.load(f)
+                page.evaluate(f"window.scrollBy(0, {step});")
             except Exception:
-                return None
-    return None
+                pass
+        scrolled += step
+        time.sleep(random.uniform(0.12, 0.4))
 
-def save_cookies(driver, path):
-    try:
-        cookies = driver.get_cookies()
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cookies, f)
-        logging.info(f"Cookies saved to {path}")
-    except Exception as e:
-        logging.warning(f"Could not save cookies: {e}")
-
-def clean_href(href):
-    if not href:
-        return None
-    href = href.split("#")[0].rstrip("/")
-    if href.lower().startswith("javascript:") or href.lower().startswith("mailto:") or href.lower().startswith("tel:"):
-        return None
-    return href
-
-def human_move_and_hover(driver, element, steps=8):
-    try:
-        actions = ActionChains(driver)
-        box = element.rect
-        if not box or box.get("width",0) == 0:
-            actions.move_to_element(element).perform()
-            return
-        cx = box["x"] + box["width"]/2
-        cy = box["y"] + box["height"]/2
-        current_x = random.randint(100, 400)
-        current_y = random.randint(100, 400)
-        for i in range(steps):
-            t = (i+1)/steps
-            x = int(current_x + (cx - current_x) * t + random.uniform(-5,5))
-            y = int(current_y + (cy - current_y) * t + random.uniform(-5,5))
-            try:
-                actions.move_by_offset(xoffset=x - current_x, yoffset=y - current_y).perform()
-            except Exception:
+def close_cookie_banners(page):
+    # Basit denemeler: yaygın buton ve metinleri tıklamaya çalış
+    possible_selectors = [
+        "button[id*='cookie']", "button[class*='cookie']", "button[aria-label*='cookie']",
+        "button:has-text('Kabul')", "button:has-text('KABUL')", "button:has-text('Accept')",
+        "button:has-text('Tamam')", "button:has-text('Anladım')"
+    ]
+    for sel in possible_selectors:
+        try:
+            el = page.query_selector(sel)
+            if el:
                 try:
-                    actions.move_to_element_with_offset(element, 1, 1).perform()
+                    el.click(timeout=1500)
+                    logging.info("Cookie banner kapatıldı (selector): %s", sel)
+                    return True
                 except Exception:
                     pass
-            current_x, current_y = x, y
-            time.sleep(random.uniform(0.02, 0.06))
-        try:
-            actions.move_to_element(element).perform()
         except Exception:
             pass
-    except Exception as e:
-        logging.debug(f"human_move_and_hover exception: {e}")
-
-def human_scroll(driver, total_pixels=600, step_min=80, step_max=220):
-    scrolled = 0
-    while scrolled < total_pixels:
-        step = random.randint(step_min, step_max)
-        driver.execute_script(f"window.scrollBy(0, {step});")
-        scrolled += step
-        time.sleep(random.uniform(0.15, 0.6))
-
-def find_internal_links(driver, base_url):
-    anchors = driver.find_elements(By.TAG_NAME, "a")
-    hrefs = []
-    for a in anchors:
+    # metin bazlı fallback
+    texts = ["kabul", "tamam", "anladım", "accept", "agree"]
+    for t in texts:
         try:
-            href = a.get_attribute("href")
-            href = clean_href(href)
-            if href and base_url in href:
-                hrefs.append(href)
+            el = page.query_selector(f"text={t}")
+            if el:
+                try:
+                    el.click(timeout=1500)
+                    logging.info("Cookie banner kapatıldı (text): %s", t)
+                    return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return False
+
+def random_interactions_on_page(page, iterations=4):
+    # rastgele scroll, hover, click (ancak NAVIGATE yerine her zaman START_URL'e dönecek)
+    try:
+        human_scroll(page, total=random.randint(200, 1000))
+    except Exception:
+        pass
+
+    # rastgele hover ve "soft click" (eğer klik navigasyon yaparsa, hemen START_URL'e geri dön)
+    clickable_selectors = ["button", "a", "input[type=submit]", "input[type=button]"]
+    all_candidates = []
+    for sel in clickable_selectors:
+        try:
+            nodes = page.query_selector_all(sel)
+            if nodes:
+                all_candidates.extend(nodes)
+        except Exception:
+            pass
+
+    random.shuffle(all_candidates)
+    attempts = min(len(all_candidates), iterations)
+    for i in range(attempts):
+        el = all_candidates[i]
+        try:
+            box = el.bounding_box()
+            if not box:
+                continue
+            cx = box["x"] + box["width"]/2
+            cy = box["y"] + box["height"]/2
+            human_move(page.mouse, (random.randint(80,300), random.randint(80,300)), (cx, cy), steps=random.randint(30,90))
+            # soft click via evaluate to reduce unexpected navigation behavior
+            try:
+                page.evaluate("(el)=>{ el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true})); el.dispatchEvent(new MouseEvent('mouseup',{bubbles:true})); }", el)
+                # if element has click handler, try click()
+                try:
+                    el.click(timeout=800)
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    el.click(timeout=800)
+                except Exception:
+                    pass
+            # küçük bekleme
+            time.sleep(random.uniform(0.6, 1.8))
+            # ensure we are on START_URL (the user requested all links go to that fixed link)
+            if page.url != START_URL:
+                try:
+                    page.goto(START_URL, wait_until="domcontentloaded", timeout=20000)
+                except Exception:
+                    pass
+                time.sleep(random.uniform(0.5, 1.2))
         except Exception:
             continue
-    unique = list(dict.fromkeys(hrefs))
-    return unique
 
-# -------- DRIVER SETUP --------
-def make_driver(headless=False, user_agent=None, firefox_binary_path=None):
-    options = Options()
-    options.headless = headless
-    if firefox_binary_path:
-        options.binary_location = firefox_binary_path
-    if user_agent:
-        options.set_preference("general.useragent.override", user_agent)
-    options.set_preference("dom.webdriver.enabled", False)
-    options.set_preference("useAutomationExtension", False)
-    options.set_preference("media.peerconnection.enabled", False)
-    service = Service(executable_path=GeckoDriverManager().install())
-    driver = webdriver.Firefox(service=service, options=options)
-    driver.set_page_load_timeout(40)
-    return driver
+# ------- OTURUM (tek ziyaret döngüsü) -------
+def run_session(playwright, headless=False, max_pages=DEFAULT_MAX_PAGES):
+    browser = playwright.firefox.launch(headless=headless)
+    ua = random.choice(USER_AGENTS)
+    vp = random.choice(VIEWPORTS)
+    locale = random.choice(LOCALES)
+    context = browser.new_context(viewport={"width": vp[0], "height": vp[1]}, user_agent=ua, locale=locale)
+    page = context.new_page()
 
-# -------- SINGLE RUN (one cycle through site) --------
-def single_run(click_selector=None, headless=False, visit_limit=DEFAULT_VISIT_LIMIT, cookies_enabled=True):
-    ua = rand_user_agent()
-    logging.info(f"single_run: UA={ua} headless={headless} visit_limit={visit_limit}")
-    driver = None
     try:
-        driver = make_driver(headless=headless, user_agent=ua)
-        base_origin = "{uri.scheme}://{uri.netloc}".format(uri=urlparse(START_URL))
-
-        # load cookies if exist
-        if cookies_enabled:
-            cookies = load_cookies(COOKIES_FILE)
-            if cookies:
-                try:
-                    driver.get(base_origin)
-                    for ck in cookies:
-                        ck_clean = {k:v for k,v in ck.items() if k in ("name","value","path","domain","secure","expiry","httpOnly")}
-                        try:
-                            driver.add_cookie(ck_clean)
-                        except Exception:
-                            pass
-                    logging.info("Loaded cookies into browser (if compatible).")
-                except Exception:
-                    logging.debug("Could not load cookies before navigation.")
-
-        # Visit start page
+        logging.info("Navigating to START_URL: %s", START_URL)
         try:
-            logging.info(f"GET {START_URL}")
-            driver.get(START_URL)
-            human_sleep(1.0, 2.5)
-            # screenshots disabled by config
-            save_screenshot(driver, "start_page")
-        except Exception as e:
-            logging.error(f"Cannot open start_url: {e}")
-            save_screenshot(driver, "start_error")
-            return
+            page.goto(START_URL, wait_until="domcontentloaded", timeout=30000)
+        except PWTimeout:
+            logging.warning("Timeout loading START_URL; continuing.")
+        time.sleep(random.uniform(0.7, 2.0))
 
-        # small interactions
+        # cookie banner varsa kapatmaya çalış
         try:
-            human_scroll(driver, total_pixels=random.randint(200,900))
-            human_sleep(0.5,1.8)
+            close_cookie_banners(page)
         except Exception:
             pass
 
-        # BFS-like limited crawl
-        visited = set()
-        to_visit = [START_URL]
-        while to_visit and len(visited) < visit_limit:
-            cur = to_visit.pop(0)
-            if cur in visited:
-                continue
+        # birkaç kez site içi etkileşim (her seferinde START_URL korunur)
+        interactions = random.randint(2, max_pages)
+        for _ in range(interactions):
+            random_interactions_on_page(page, iterations=random.randint(1,4))
+            # ufak bekleme
+            time.sleep(random.uniform(0.8, 2.2))
+
+        logging.info("Session finished (ensuring we end at START_URL).")
+        if page.url != START_URL:
             try:
-                logging.info(f"Visiting {cur} ({len(visited)+1}/{visit_limit})")
-                driver.get(cur)
-                human_sleep(1.2, 3.5)
-                save_screenshot(driver, "page")
-                human_scroll(driver, total_pixels=random.randint(200,800))
-                human_sleep(0.6, 1.6)
-
-                links = find_internal_links(driver, base_origin)
-                if links and random.random() < 0.4:
-                    target_url = random.choice(links)
-                    logging.info(f"Following random internal link to {target_url}")
-                    try:
-                        elem = driver.find_element(By.XPATH, f"//a[@href='{target_url}']")
-                        human_move_and_hover(driver, elem, steps=random.randint(6,15))
-                        human_sleep(0.2,0.6)
-                        elem.click()
-                        human_sleep(1.0, 2.4)
-                        if random.random() < 0.6:
-                            driver.back()
-                            human_sleep(0.5, 1.6)
-                    except Exception:
-                        if target_url not in visited and target_url not in to_visit:
-                            to_visit.append(target_url)
-
-                visited.add(cur)
-                new_links = find_internal_links(driver, base_origin)
-                for l in new_links:
-                    if l not in visited and l not in to_visit and len(to_visit) < visit_limit:
-                        to_visit.append(l)
-            except WebDriverException as e:
-                logging.warning(f"WebDriverException on {cur}: {e}")
-                save_screenshot(driver, "webdriver_exc")
-                time.sleep(1 + random.random()*2)
-            except Exception:
-                logging.error("Unhandled exception: " + traceback.format_exc())
-                save_screenshot(driver, "unhandled_exc")
-
-        # final click if provided
-        if click_selector:
-            try:
-                logging.info(f"Attempting final click selector: {click_selector}")
-                if click_selector.startswith("text="):
-                    text = click_selector.split("=",1)[1]
-                    el = driver.find_element(By.XPATH, f"//*[contains(normalize-space(), '{text}')]")
-                elif click_selector.startswith("css="):
-                    sel = click_selector.split("=",1)[1]
-                    el = driver.find_element(By.CSS_SELECTOR, sel)
-                else:
-                    el = driver.find_element(By.CSS_SELECTOR, click_selector)
-
-                human_move_and_hover(driver, el, steps=random.randint(8,18))
-                human_sleep(0.2, 0.6)
-                el.click()
-                human_sleep(1.5, 3.0)
-                save_screenshot(driver, "final_click")
-            except Exception as e:
-                logging.warning(f"Final click failed: {e}")
-                save_screenshot(driver, "final_click_failed")
-
-        if cookies_enabled:
-            try:
-                save_cookies(driver, COOKIES_FILE)
+                page.goto(START_URL, wait_until="domcontentloaded", timeout=20000)
             except Exception:
                 pass
+        # save final small info
+        logging.info("Final page url: %s", page.url)
+
+    except Exception as e:
+        logging.warning("Session error: %s", e)
 
     finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
-        logging.info("single_run finished.")
+        try:
+            context.close()
+        except Exception:
+            pass
+        try:
+            browser.close()
+        except Exception:
+            pass
 
-# -------- ENTRY & REPEATS --------
-def parse_args():
-    p = argparse.ArgumentParser(description="Human-like Selenium test (fixed start URL). Use only on sites you own/have permission.")
-    p.add_argument("--click-selector", "-c", help='Selector to click at the end. Use forms: "text=Giriş" or "css=a.btn"')
-    p.add_argument("--headless", action="store_true", help="Run browser headless")
-    p.add_argument("--limit", type=int, default=DEFAULT_VISIT_LIMIT, help="Max pages to visit per run")
-    p.add_argument("--no-cookies", action="store_true", help="Do not load/save cookies")
-    p.add_argument("--repeats", type=int, default=REPEATS, help="How many times to repeat the single_run cycle")
-    return p.parse_args()
+# ------- ENTRY POINT -------
+def main():
+    parser = argparse.ArgumentParser(description="Run fixed-visitor sessions to START_URL.")
+    parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS, help="How many sessions to run (default 10)")
+    parser.add_argument("--headless", action="store_true", help="Run headless")
+    parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES, help="Max interactions per session")
+    args = parser.parse_args()
+
+    logging.info("Starting fixed visitor. START_URL=%s repeats=%d headless=%s", START_URL, args.repeats, args.headless)
+    with sync_playwright() as p:
+        for i in range(args.repeats):
+            logging.info("=== Session %d/%d ===", i+1, args.repeats)
+            run_session(p, headless=args.headless, max_pages=args.max_pages)
+            # nazik bekleme
+            time.sleep(random.uniform(3, 12))
+    logging.info("All sessions done.")
 
 if __name__ == "__main__":
-    args = parse_args()
-    repeats = max(1, args.repeats)
-    logging.info(f"Starting full run: START_URL={START_URL} repeats={repeats}")
-    for i in range(repeats):
-        logging.info(f"=== Run {i+1}/{repeats} ===")
-        single_run(click_selector=args.click_selector, headless=args.headless, visit_limit=args.limit, cookies_enabled=not args.no_cookies)
-        # polite wait between repeats
-        time.sleep(random.uniform(3, 10))
-    logging.info("All repeats finished.")
+    main()
